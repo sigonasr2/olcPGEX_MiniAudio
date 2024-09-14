@@ -82,14 +82,14 @@ namespace olc
         void SetBackgroundPlay(bool state);
 
     public: // LOADING ROUTINES       
-        const int LoadSound(const std::string& path);
+        const int LoadSound(const std::string& path, olc::ResourcePack* const pack = nullptr);
         void UnloadSound(const int id);
     
     public: // PLAYBACK CONTROLS
         // plays a sample, can be set to loop
         void Play(const int id, const bool loop = false);
         // plays a sound file, as a one off, and automatically unloads it
-        void Play(const std::string& path);
+        void Play(const std::string& path, olc::ResourcePack* const pack = nullptr);
         // stops a sample, rewinds to beginning
         void Stop(const int id);
         // pauses a sample, does not change position
@@ -202,12 +202,34 @@ namespace olc
         // this is where the sounds are kept
         std::vector<ma_sound*> vecSounds;
         std::vector<ma_sound*> vecOneOffSounds;
+        
+        // Persistent data structure for Resource pack loaded sounds.
+        struct ResourceData{
+            ResourceBuffer data;
+            std::string path;
+        };
+        // The data from a resource pack needs to persist in memory while a sound plays.
+        std::vector<std::unique_ptr<ResourceData>>vecBufferData;
+
+        using SoundPath = std::string;
+
+        // It's possible we use the same name for multiple resources (one-off sounds, loading the same resource in two places...)
+        // In either scenario we can't just delete the resource from miniaudio's resource manager straight away, so we refcount
+        // the sounds as they get destroyed to see if we can safely remove it from the resource manager.
+        std::unordered_map<SoundPath, size_t>resourceRefCount;
+        // Sounds can only be identified by their pointers. We'll store additional data about what path each sound pointer corresponds to.
+        std::unordered_map<ma_sound*, SoundPath>soundPaths;
+
 
         static std::vector<Waveform> vecWaveforms;
 
         static float noiseLeftChannel;
         static float noiseRightChannel;
         static std::function<void(float& out_data_channel_left, float& out_data_channel_right, const float fElapsedTime)> noiseCallback;
+
+        // This identifier is placed in front of a sound that is loaded via resource pack. The miniaudio resource manager must have a unique filename for each resource.
+        // We get to supply a fake filename to load our sound from and this will reduce a potential name conflict.
+        const std::string RESOURCE_PACK_IDENTIFIER = "RESOURCE_PACK_";
     };
 
     /**
@@ -254,6 +276,22 @@ namespace olc
         const char* what() const throw()
         {
             return "Failed to initialize a waveform.";
+        }
+    };
+
+    struct MiniAudioResourcePackLoadException : public std::exception
+    {
+        const char* what() const throw()
+        {
+            return "Failed to load a sound from resource pack.";
+        }
+    };
+
+    struct MiniAudioResourcePackUnloadException : public std::exception
+    {
+        const char* what() const throw()
+        {
+            return "Failed to unload a sound from resource pack.";
         }
     };
 }
@@ -334,6 +372,22 @@ namespace olc
         {
             if(!ma_sound_is_playing(vecOneOffSounds.at(i)))
             {
+                ma_sound* originalSoundPtr = vecOneOffSounds.at(i);
+                // we have to clean up after ourselves, look for a resource pack buffer entry...
+                if(soundPaths.count(originalSoundPtr) > 0){
+                    const SoundPath&path = soundPaths.at(originalSoundPtr);
+                    resourceRefCount[path]--;
+                    if(resourceRefCount[path] == 0) {
+                        if(ma_resource_manager_unregister_data(ma_engine_get_resource_manager(&engine), (RESOURCE_PACK_IDENTIFIER + path).c_str()) != MA_SUCCESS)
+                            throw MiniAudioResourcePackUnloadException();
+
+                        auto bufferIt = std::find_if(vecBufferData.begin(), vecBufferData.end(), [&path](const std::unique_ptr<ResourceData>&resource){ return resource->path == path; });
+                        if(bufferIt != vecBufferData.end())
+                            vecBufferData.erase(bufferIt); //NOTE: bufferIt is no longer useable after this call!!!
+                    }
+                }
+                
+                soundPaths.erase(originalSoundPtr);
                 ma_sound_uninit(vecOneOffSounds.at(i));
                 vecOneOffSounds.erase(vecOneOffSounds.begin() + i);
                 break;
@@ -440,36 +494,78 @@ namespace olc
         MiniAudio::backgroundPlay = state;
     }
 
-    const int MiniAudio::LoadSound(const std::string& path)
+    const int MiniAudio::LoadSound(const std::string& path, olc::ResourcePack* const pack)
     {
         // create the sound
         ma_sound* sound = new ma_sound();
-
-        // load it from the file and decode it
-        if(ma_sound_init_from_file(&engine, path.c_str(), MA_SOUND_FLAG_DECODE | MA_SOUND_FLAG_ASYNC, NULL, NULL, sound) != MA_SUCCESS)
-            throw MiniAudioSoundException();
         
+        // by default the sound will be appended at the end of the vector.
+        int soundId = vecSounds.size();
+
         // attempt to re-use an empty slot
         for(int i = 0; i < vecSounds.size(); i++)
         {
             if(vecSounds.at(i) == nullptr)
             {
                 vecSounds.at(i) = sound;
-                return i;
+                soundId = i;
+                break;
             }
         }
+
+        if (pack != nullptr) {
+            // we are loading from a resource pack. we create a "resource pack file path" for the MiniAudioPGEX to use.
+            // this is nice because we don't have to change how we play sounds.
+            // store the file buffer since miniaudio's resource manager will have to retrieve its data in the future.
+
+            // first check if the resource already exists.
+            bool IsSoundAlreadyLoaded = std::any_of(vecBufferData.begin(), vecBufferData.end(), [&path](const std::unique_ptr<ResourceData>& data){ return data->path == path; });
+
+            // the result of the earlier search determines if we register to the resource manager for the first time or simply increment the ref counter.
+            if(!IsSoundAlreadyLoaded) { 
+                resourceRefCount[path] = 1;
+                // now create the resource.
+                ResourceData& resource = *vecBufferData.emplace_back(std::make_unique<ResourceData>(pack->GetFileBuffer(path), path));
+                if(ma_resource_manager_register_encoded_data(ma_engine_get_resource_manager(&engine), (RESOURCE_PACK_IDENTIFIER + path).c_str(), resource.data.vMemory.data(), resource.data.vMemory.size()) != MA_SUCCESS)
+                    throw MiniAudioResourcePackLoadException();
+            } else {
+                // I guess we wanted to load the same sound twice? We'll support it, obviously don't need to re-register the data; just increase the reference counter.
+                resourceRefCount[path]++;
+            }
+            soundPaths[sound] = path;
+            // now load the sound as if we actually had a normal file.
+            if(ma_sound_init_from_file(&engine, (RESOURCE_PACK_IDENTIFIER + path).c_str(), MA_SOUND_FLAG_DECODE | MA_SOUND_FLAG_ASYNC, NULL, NULL, sound) != MA_SUCCESS)
+                throw MiniAudioSoundException();
+        } else {
+            // load it from the file and decode it
+            if(ma_sound_init_from_file(&engine, path.c_str(), MA_SOUND_FLAG_DECODE | MA_SOUND_FLAG_ASYNC, NULL, NULL, sound) != MA_SUCCESS)
+                throw MiniAudioSoundException();
+        }
         
-        // no empty slots, make more room!
-        const int id = vecSounds.size();
         vecSounds.push_back(sound);
         
-        return id;
+        return soundId;
     }
     
     void MiniAudio::UnloadSound(const int id)
     {
         ma_sound_uninit(vecSounds.at(id));
-        delete vecSounds.at(id);
+        ma_sound* originalSoundPtr = vecSounds.at(id);
+
+        // we have to clean up after ourselves, look for a resource pack buffer entry...
+        if(soundPaths.count(originalSoundPtr) > 0) {
+            const std::string& path = soundPaths.at(originalSoundPtr);
+            resourceRefCount[path]--;
+            if(resourceRefCount[path] == 0) {
+                if(ma_resource_manager_unregister_data(ma_engine_get_resource_manager(&engine), (RESOURCE_PACK_IDENTIFIER + path).c_str()) != MA_SUCCESS)
+                    throw MiniAudioResourcePackUnloadException();
+                auto bufferIt = std::find_if(vecBufferData.begin(), vecBufferData.end(), [&path](const std::unique_ptr<ResourceData>& data){ return data->path == path; });
+                vecBufferData.erase(bufferIt); //NOTE: bufferIt is no longer useable after this call!!!
+            }
+            soundPaths.erase(originalSoundPtr);
+        }
+
+        delete originalSoundPtr;
         vecSounds.at(id) = nullptr;
     }
 
@@ -485,14 +581,44 @@ namespace olc
         ma_sound_start(vecSounds.at(id));
     }
 
-    void MiniAudio::Play(const std::string& path)
+    void MiniAudio::Play(const std::string& path, olc::ResourcePack* const pack)
     {
         // create the sound
         ma_sound* sound = new ma_sound();
 
-        // load it from the file and decode it
-        if(ma_sound_init_from_file(&engine, path.c_str(), MA_SOUND_FLAG_DECODE | MA_SOUND_FLAG_ASYNC, NULL, NULL, sound) != MA_SUCCESS)
-            throw MiniAudioSoundException();
+        if (pack != nullptr) {
+            // we are loading from a resource pack. we create a "resource pack file path" for the MiniAudioPGEX to use.
+            // this is nice because we don't have to change how we play sounds.
+            // store the file buffer since miniaudio's resource manager will have to retrieve its data in the future.
+            // 
+
+            int soundInd = vecOneOffSounds.size();
+
+            // first check if the resource already exists.
+            bool IsSoundAlreadyLoaded = std::any_of(vecBufferData.begin(), vecBufferData.end(), [&path](const std::unique_ptr<ResourceData>& data){ return data->path == path; });
+
+
+            // the result of the earlier search determines if we register to the resource manager for the first time or simply increment the ref counter.
+            if(!IsSoundAlreadyLoaded) { 
+                resourceRefCount[path] = 1;
+                // now create the resource.
+                ResourceData& resource = *vecBufferData.emplace_back(std::make_unique<ResourceData>(pack->GetFileBuffer(path), path));
+                if(ma_resource_manager_register_encoded_data(ma_engine_get_resource_manager(&engine), (RESOURCE_PACK_IDENTIFIER+path).c_str(), resource.data.vMemory.data(), resource.data.vMemory.size()) != MA_SUCCESS)
+                    throw MiniAudioResourcePackLoadException();
+            } else {
+                // This is another instance of the same sound. No need to re-register the sound, just increase the ref count.
+                resourceRefCount[path]++;
+            }
+            soundPaths[sound] = path;
+            // now load the sound as if we actually had a normal file.
+            if(ma_sound_init_from_file(&engine, (RESOURCE_PACK_IDENTIFIER+path).c_str(), MA_SOUND_FLAG_DECODE | MA_SOUND_FLAG_ASYNC, NULL, NULL, sound) != MA_SUCCESS)
+                throw MiniAudioSoundException();
+        } else {
+            // load it from the file and decode it
+            if(ma_sound_init_from_file(&engine, path.c_str(), MA_SOUND_FLAG_DECODE | MA_SOUND_FLAG_ASYNC, NULL, NULL, sound) != MA_SUCCESS)
+                throw MiniAudioSoundException();
+        }
+
         
         ma_sound_start(sound);
         vecOneOffSounds.push_back(sound);
